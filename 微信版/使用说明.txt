@@ -1,0 +1,106 @@
+============================================================
+  微信聊天机器人（DeepSeek V4.1 Flash 版）—— 使用说明
+============================================================
+
+【一、这是什么】
+  基于 wechatauto-replica（微信 4.x 桌面端自动化）+ LangChain + DeepSeek V4.1 Flash
+  的拟人化微信聊天机器人，已具备：
+
+    · 对话记忆    SQLite 持久化，重启后依然记得聊过什么
+    · 用户画像    每 6 轮自动抽取长期事实（称呼、喜好、在做什么）
+    · 情绪状态    好感度 / 心情 / 精力，持续演化并影响语气
+    · 知识库 RAG  把资料放进 知识库.txt，回答时自动引用
+    · 图片理解    DeepSeek V4.1 Flash 原生多模态，能看懂图片和表情包
+    · 语音回复    edge-tts 合成（可选 GPT-SoVITS 音色克隆）
+    · 表情包      按当前心情自动挑图发送
+    · 拟人行为    分条发送、打字延迟、去掉括号动作、群里被 @ 才回应
+
+【二、环境要求】
+  - Windows 10/11
+  - Python 3.12（注意：3.14 装不上 wechatauto-replica 的 winsdk 依赖）
+  - 微信桌面客户端 4.x，并保持登录、窗口打开
+  - 一个 DeepSeek API Key（https://platform.deepseek.com 申请）
+
+【三、安装】
+  1) 创建虚拟环境
+     python -m venv venv
+     venv\Scripts\activate
+     （若提示"禁止运行脚本"，见【七、常见问题 1】）
+
+  2) 安装依赖
+     venv\Scripts\python.exe -m pip install -r requirements-wechat.txt
+
+  3) 配置密钥
+     copy .env.example .env
+     notepad .env          →  填入 DEEPSEEK_API_KEY=sk-你的密钥
+
+【四、运行】
+  cd 到本目录后执行：
+     venv\Scripts\python.exe wechat_bot.py
+
+  前置条件：微信已登录且窗口保持打开（可以最小化，但别退出）。
+  停止：Ctrl+C；或在被监听的会话里发 quit / 退出。
+
+【五、文件说明】
+  wechat_bot.py            主程序（所有功能都在这里）
+  语音.py                 语音合成模块（edge-tts / GPT-SoVITS）
+  查看状态.py              查看每个人的好感度/心情/精力（不需要 API Key）
+  test_vision.py           识图自检脚本（验证多模态是否正常）
+  知识库.txt               RAG 知识库（放你自己的资料，UTF-8 编码）
+  requirements-wechat.txt  依赖清单
+  .env.example             密钥配置模板（复制为 .env）
+  表情包/                  表情包图片目录（放 gif/png，按文件名匹配心情）
+  memory.db                记忆数据库（自动生成，含聊天记录与画像，注意隐私）
+  voice_cache/             语音缓存（自动生成，自动清理旧文件）
+  media_cache/             图片缓存（自动生成）
+
+【六、配置速查】（都在 wechat_bot.py 顶部）
+  MODEL_NAME = "deepseek-flash"   模型（原生多模态，文字+识图同一个）
+  LISTEN_NAMES = [...]            监听哪些联系人或群（留空 = 监听全部）
+  GROUP_AT_ONLY = True            群里是否只在被 @ 时回应
+  BOT_NAMES = []                  群里 @ 时识别用的称呼（留空自动用微信昵称）
+  SPLIT_REPLY / MAX_SEGMENTS      分条发送
+  TYPING_SPEED / FIRST_DELAY      打字延迟
+  NO_ACTION = True                去掉回复里的括号动作描写
+  VOICE_ENABLED / VOICE_PROB      语音开关与概率
+  STICKER_ENABLED / STICKER_PROB  表情包开关与概率
+  STATE_ENABLED / PROFILE_EVERY   情绪状态与画像抽取频率
+  VISION_ENABLED                  图片理解开关
+  GROUP_REPLY_IMAGE = False       群里是否也回应图片
+
+【七、常见问题】
+  1. 报错"禁止运行脚本 Activate.ps1"
+     执行：Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+     或干脆不激活，直接用 venv\Scripts\python.exe 运行
+
+  2. 报错"数据库无可用密钥 / 0 个密钥验证通过"
+     wechatauto-replica 需要微信 4.1.12+ 才能正确提取密钥。
+     若你的微信版本过低（如 4.0.6），请升级微信到最新版后重试。
+     排查命令：venv\Scripts\python.exe -m wechatauto.diagnose_keys
+
+  3. 机器人自问自答
+     已内置"回声去重"（记录发出去的内容，短时间内的相同消息跳过）。
+     若仍出现，说明消息带了额外前缀，请把控制台输出发来。
+
+  4. 控制台出现"拿不到消息 local_id"
+     说明该版本的消息对象字段名不同，图片无法下载。
+     把提示里的原始值和消息类型发来即可修正。
+
+  5. 控制台中文/emoji 显示为问号
+     中文 Windows 控制台是 GBK 编码，程序已做兼容（不会崩溃，emoji 显示为 ?）。
+     想看完整效果可用 Windows Terminal 并把编码设为 UTF-8。
+
+  6. 群里 @ 了但没反应
+     确认 @ 的是你的微信昵称，或把该称呼写进 BOT_NAMES；
+     若微信不把 @ 符号写进消息内容，把 GROUP_AT_ONLY 改成 False。
+
+【八、安全与风险提示】
+  1. 个人微信自动化违反《微信个人账号使用规范》，存在封号风险，
+     建议用小号测试、控制频率、不要群发或用于营销。
+  2. .env（密钥）与 memory.db（聊天记录+用户画像）属于隐私文件，
+     不要提交到 git、不要外发；删除 memory.db 即可清空所有记忆。
+  3. API 费用：主对话、画像抽取、识图都会消耗 token，
+     图片按 token 计费（一张图最多约 384 tokens）。
+     可通过调大 PROFILE_EVERY、降低 VOICE_PROB/STICKER_PROB 来省钱。
+
+============================================================

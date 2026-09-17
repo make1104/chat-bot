@@ -1,0 +1,80 @@
+============================================================
+  对话机器人（DeepSeek 版）—— 环境配置与使用说明
+============================================================
+
+【一、项目简介】
+  基于 LangChain + DeepSeek 的带记忆聊天机器人，包含两个版本：
+    - chatbot.py        基础版：自动记忆多轮对话 + 编码容错
+    - chatbot_v2.py     增强版：在基础版上增加
+                           ① 多会话隔离（启动时可切换会话名称）
+                           ② 历史修剪（trim_messages，防止上下文溢出）
+                           ③ 流式输出（打字机效果）
+
+【二、环境要求】
+  - Python 3.8+（本项目在 Python 3.12 上验证通过）
+  - 一个 DeepSeek API Key（在 https://platform.deepseek.com/ 申请）
+  - 能正常访问 api.deepseek.com 的网络
+
+【三、安装步骤】
+  1. 创建并激活虚拟环境
+     Windows:
+       python -m venv venv
+       venv\Scripts\activate
+     Linux / WSL:
+       python3 -m venv venv
+       source venv/bin/activate
+
+  2. 安装依赖
+     pip install -r requirements.txt
+     （会自动安装 langchain、langchain-core、langchain-deepseek、python-dotenv）
+
+  3. 配置 API Key（二选一）
+     方式 A：使用 .env 文件（推荐）
+       cp .env.example .env        （Windows 用: copy .env.example .env）
+       编辑 .env，把 DEEPSEEK_API_KEY=sk-替换为你的DeepSeek密钥
+       改成你自己的真实密钥
+     方式 B：使用环境变量
+       Windows PowerShell:  $env:DEEPSEEK_API_KEY = "sk-你的密钥"
+       Linux / WSL:         export DEEPSEEK_API_KEY="sk-你的密钥"
+
+【四、运行】
+  python chatbot.py          # 基础版
+  python chatbot_v2.py       # 增强版（推荐）
+
+【五、使用说明】
+  基础版（chatbot.py）：
+    - 启动后直接输入文字对话，机器人自动记住上下文
+    - 输入 quit 或 退出 结束
+  增强版（chatbot_v2.py）：
+    - 启动时提示输入"会话名称"：不同名称 = 不同对话，互不干扰
+      （例如输入 alice 和 bob，两人各聊各的，互不记得对方的话）
+    - 回复为流式输出（逐字显示，打字机效果）
+    - 历史会自动修剪到 max_tokens 上限（默认 500，按字符数估算），
+      防止长对话撑爆模型的上下文窗口；
+      代价是模型会"忘掉"被剪掉的早期内容
+    - 想调整记忆长度：修改 chatbot_v2.py 中 trim_messages 的 max_tokens 参数
+
+【六、常见问题排查】
+  1. 报错：No module named 'langchain_core'
+     → 依赖未安装，先执行 pip install -r requirements.txt
+  2. 报错：DEEPSEEK_API_KEY 未检测到
+     → 检查 .env 文件是否存在、密钥是否已替换为真实值；
+       或检查环境变量是否设置（注意：Windows 设置的环境变量不会自动
+       带入 WSL，WSL 里需要单独 export）
+  3. 报错：UnicodeEncodeError ... surrogates not allowed
+     → 终端里输入/粘贴了特殊符号（可能产生"半个 emoji"），
+       两个版本都已内置字符清洗，不会崩溃；
+       建议终端使用 UTF-8 编码（export LANG=C.UTF-8），并优先使用 Windows Terminal
+  4. 报错：get_num_tokens_from_messages() is not presently implemented
+     → 这是旧版用模型数 token 导致的（DeepSeek 模型不支持该方法），
+       v2 已改用自定义字符计数函数，可忽略
+  5. WSL 提示 localhost 代理未镜像
+     → 如果调用 API 成功可忽略；若网络不通，需在 WSL 里单独配置代理
+
+【七、安全提示】
+  - .env 包含真实密钥，已被 .gitignore 忽略，切勿提交到版本库
+  - 不要把 API Key 硬编码进源码
+  - 对话记忆默认保存在内存中，程序重启即清空；
+    需要跨重启持久化，可改用 SQLChatMessageHistory（存 SQLite）
+
+============================================================

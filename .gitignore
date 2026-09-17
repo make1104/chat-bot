@@ -1,0 +1,36 @@
+# ============ 密钥与隐私（绝对不要提交）============
+.env
+*.env
+!.env.example
+memory.db
+*.db
+*.sqlite
+*.sqlite3
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ============ 虚拟环境 ============
+venv/
+.venv/
+env/
+
+# ============ 运行时缓存与日志 ============
+voice_cache/
+media_cache/
+wechatauto_logs/
+logs/
+
+# ============ 表情包图片（体积大时可取消注释不入库）============
+# 微信版/表情包/*.gif
+# 微信版/表情包/*.png
+# 微信版/表情包/*.jpg
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

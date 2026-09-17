@@ -1,0 +1,8 @@
+# 环境与密钥文件（绝不要提交）
+.env
+venv/
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
