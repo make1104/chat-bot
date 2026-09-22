@@ -562,6 +562,8 @@ def pick_sticker(mood_score: int) -> str:
 VISION_ENABLED = True
 MEDIA_DIR = "media_cache"         # 图片下载缓存目录
 GROUP_REPLY_IMAGE = False         # 群里收到图片是否也回应（默认否，避免刷屏）
+IMAGE_GUI_FALLBACK = True         # 本地无原图缓存时，是否模拟点击消息触发微信下载原图
+                                  # （需微信窗口可见；关掉则只认已缓存的图）
 VISION_PROMPT = ("用一两句中文描述这张图片或表情包的内容；如果是表情包，"
                  "说明它表达的情绪和图中的文字。直接描述，不要客套。")
 
@@ -569,28 +571,89 @@ _media_downloader = None
 _media_db = None
 
 
-def download_message_media(msg, who: str) -> str:
-    """把图片/表情包消息解密保存到本地，返回文件路径；失败返回空字符串。"""
-    global _media_downloader, _media_db
-    raw_id = str(
+def _msg_local_id(msg):
+    """从消息对象取 local_id（不同版本字段名不同，逐个尝试）。"""
+    raw = str(
         getattr(msg, "id", None)
         or getattr(msg, "msg_id", None)
         or getattr(msg, "local_id", "")
         or ""
     )
-    local_id = raw_id.replace("db-", "").strip()
-    if not local_id.isdigit():
-        print(f"⚠️ 拿不到消息 local_id（原始值：{raw_id!r}），无法下载图片")
+    lid = raw.replace("db-", "").strip()
+    return int(lid) if lid.isdigit() else None
+
+
+def _downloader() -> "MediaDownloader":
+    """懒加载媒体下载器（全局复用一个实例）。"""
+    global _media_downloader, _media_db
+    if _media_downloader is None:
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        _media_db = WeChatDB()
+        _media_downloader = MediaDownloader(_media_db, save_dir=MEDIA_DIR)
+    return _media_downloader
+
+
+def download_message_media(msg, who: str) -> str:
+    """解密微信本地 .dat 缓存拿图片（快，不需要界面）。"""
+    local_id = _msg_local_id(msg)
+    if local_id is None:
+        print("⚠️ 拿不到消息 local_id，无法解密图片")
         return ""
     try:
-        os.makedirs(MEDIA_DIR, exist_ok=True)
-        if _media_downloader is None:
-            _media_db = WeChatDB()
-            _media_downloader = MediaDownloader(_media_db, save_dir=MEDIA_DIR)
-        return _media_downloader.download_media(who, int(local_id), MEDIA_DIR) or ""
+        return _downloader().download_media(who, local_id, MEDIA_DIR) or ""
     except Exception as e:
-        print(f"⚠️ 图片下载失败：{e}")
+        print(f"⚠️ 图片解密失败：{e}")
         return ""
+
+
+def download_image_original(msg, who: str) -> str:
+    """界面路径：模拟点击图片消息 → 触发微信下载原图 → 解密保存。
+
+    专治"原图从未在微信里点开过、本地没有 .dat 缓存"的情况。
+    代价：需要微信窗口可见，并等待微信下载原图（几秒~几十秒）。
+    """
+    local_id = _msg_local_id(msg)
+    if local_id is None:
+        return ""
+    try:
+        return _downloader().download_image_original(who, local_id, MEDIA_DIR) or ""
+    except Exception as e:
+        print(f"⚠️ 界面触发原图下载失败：{e}")
+        return ""
+
+
+def get_message_image(msg, who: str) -> str:
+    """把图片/表情包消息变成可读的图片文件路径；失败返回空字符串。
+
+    三条路（这是之前收不到表情包/图片回复的关键）：
+      · 表情包(emotion) → 数据库里是加密数据无法解密，改用屏幕截图 msg.capture()
+      · 图片(image)     → ① 先解密本地 .dat 缓存（快、无需界面）
+                          ② 没缓存则模拟点击消息触发微信下载原图（慢、需窗口可见）
+    """
+    mtype = str(getattr(msg, "type", "") or "").lower()
+    cls = type(msg).__name__
+    if mtype == "emotion" or "Emoji" in cls:
+        if not hasattr(msg, "capture"):
+            print(f"⚠️ 该消息没有 capture 方法（{cls}），无法获取表情包图片")
+            return ""
+        try:
+            os.makedirs(MEDIA_DIR, exist_ok=True)
+            path = msg.capture(save_dir=MEDIA_DIR)
+            if not path:
+                print("⚠️ 表情包截图失败：微信窗口是否可见？是否锁屏？")
+            return path or ""
+        except Exception as e:
+            print(f"⚠️ 表情包截图失败：{e}")
+            return ""
+
+    # 普通图片：先试本地缓存解密，没有缓存再走界面触发下载
+    path = download_message_media(msg, who)
+    if not path and IMAGE_GUI_FALLBACK:
+        print("ℹ️ 本地无原图缓存，改用界面点击触发微信下载原图（较慢，请稍候）…")
+        path = download_image_original(msg, who)
+        if path:
+            print("✅ 界面触发下载原图成功")
+    return path
 
 
 def describe_image(path: str) -> str:
@@ -641,19 +704,26 @@ def main():
             return
 
         # ---- 图片 / 表情包：先用视觉模型看懂，再把描述当成"对方说的话" ----
-        kind = type(msg).__name__
-        if ("Image" in kind or "Emoji" in kind) and VISION_ENABLED:
+        # 用 msg.type 判断（库里的取值：'image'=图片，'emotion'=动画表情），类名做兜底
+        mtype = str(getattr(msg, "type", "") or "").lower()
+        cls = type(msg).__name__
+        is_image = mtype in ("image", "emotion") or "Image" in cls or "Emoji" in cls
+
+        if is_image and VISION_ENABLED:
             if who.endswith("@chatroom") and not GROUP_REPLY_IMAGE:
-                return  # 群里默认不理会图片，避免刷屏
-            path = download_message_media(msg, who)
+                print(f"⏭️ 群聊图片默认不回应（GROUP_REPLY_IMAGE=False）：[{who}] type={mtype or cls}")
+                return
+            path = get_message_image(msg, who)
             desc = describe_image(path) if path else ""
             if not desc:
-                print("⏭️ 图片未能识别（没配视觉模型或下载失败），已跳过")
+                print(f"⏭️ 图片未能识别（type={mtype or cls}，图片获取或识别失败），已跳过")
                 return
             print(f"🖼️ [{who}] 图片内容：{desc}")
             text = f"[对方发来一张图片或表情包，内容是：{desc}]"
 
         if not text:
+            if mtype and mtype != "system":
+                print(f"⏭️ 跳过未处理的消息类型：{mtype}（{cls}）")
             return
 
         # 先剥掉群消息的发送者前缀（格式 "wxid_xxx: 内容"），后面的比较和提问都用干净文本
