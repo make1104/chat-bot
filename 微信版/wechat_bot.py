@@ -32,7 +32,7 @@ from operator import itemgetter
 
 from dotenv import load_dotenv
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, trim_messages
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage, trim_messages
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -64,6 +64,40 @@ try:
 except Exception as _e:
     TOOLS, TOOL_MAP, TOOLS_IMPORT_OK = [], {}, False
     print(f"⚠️ 工具模块不可用（{_e}），将退化为纯对话模式")
+
+# 规划与反思模块（同目录的 规划.py）
+try:
+    import 规划 as QUESTION_PLANNER
+
+    PLANNER_IMPORT_OK = True
+except Exception as _e:
+    PLANNER_IMPORT_OK = False
+    print(f"⚠️ 规划模块不可用（{_e}），将跳过规划与反思")
+
+    class _NullPlanner:
+        """兜底实现：模块缺失时保证主流程无需判空。"""
+
+        @staticmethod
+        def need_plan(text):
+            return False
+
+        @staticmethod
+        def make_plan(model, question):
+            return ""
+
+        @staticmethod
+        def need_reflect(*args, **kwargs):
+            return False
+
+        @staticmethod
+        def verify(*args, **kwargs):
+            return True, ""
+
+        @staticmethod
+        def revise(model, question, draft, feedback, tools):
+            return draft
+
+    QUESTION_PLANNER = _NullPlanner()
 
 load_dotenv()
 
@@ -169,9 +203,12 @@ trimmer = trim_messages(
     start_on="human",
 )
 
-# ==================== Agent：工具调用循环 ====================
-TOOLS_ENABLED = True       # 是否启用工具调用（关掉则退化为纯对话机器人）
-MAX_TOOL_ROUNDS = 4        # 单轮对话最多几次"模型 → 工具 → 模型"
+# ==================== Agent：规划 + 工具调用 + 反思 ====================
+TOOLS_ENABLED = True        # 是否启用工具调用（关掉则退化为纯对话机器人）
+MAX_TOOL_ROUNDS = 4         # 单轮对话最多几次"模型 → 工具 → 模型"
+PLANNING_ENABLED = True     # 复杂请求是否先分解步骤（Plan-and-Execute）
+REFLECTION_ENABLED = True   # 是否对草稿做质检与修订（Reflexion）
+REFLECT_SAMPLE_RATE = 0.15  # 未用工具的普通回答，按此比例抽查质检（0~1）
 
 # 把工具绑定到模型：模型会自主决定是否调用、调用哪个、传什么参数
 model_with_tools = model.bind_tools(TOOLS) if (TOOLS_ENABLED and TOOLS_IMPORT_OK) else model
@@ -190,17 +227,79 @@ def _acc_usage(ai, acc: dict) -> None:
     acc["out"] = acc.get("out", 0) + int(u.get("output_tokens") or 0)
 
 
-def run_agent_loop(prompt_value) -> AIMessage:
-    """Agent 执行循环：模型判断 → 调用工具 → 结果回喂 → 直到给出最终回答。
+def _last_human_text(messages) -> str:
+    """取出最后一条用户消息的纯文本（用于规划与反思）。"""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = m.content
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):     # 多模态内容块
+                return " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return ""
 
-    这就是「Agent」与「聊天机器人」的分界：模型不再只是生成文本，
-    而是能主动获取信息、执行计算，再基于结果作答。
+
+def _tools_digest(calls_made) -> str:
+    """把本轮工具调用与结果整理成文本（供质检/修订作为依据）。
+
+    注意：工具输出必须保留足够完整——曾因截断到 120 字符，质检员看不到
+    真实检索内容而误判为"编造"，反而把正确答案改坏。
+    """
+    if not calls_made:
+        return ""
+    return "\n".join("%s(%s) -> %s" % (c["name"], c["args"], c["result"][:1000])
+                     for c in calls_made)
+
+
+def _evidence(messages, calls_made) -> str:
+    """汇总"模型作答时可用的全部依据"，供质检与修订使用。
+
+    必须同时包含系统提示里的参考资料——否则模型合理复述已注入的上下文事实，
+    会被质检误判成"编造"并改坏正确答案（实测踩过这个坑）。
+    """
+    parts = []
+    for m in messages:
+        if isinstance(m, SystemMessage):
+            c = m.content
+            if isinstance(c, str) and c.strip():
+                parts.append("【系统提供的参考资料】\n" + c.strip()[:2500])
+            break
+    digest = _tools_digest(calls_made)
+    if digest:
+        parts.append("【本轮工具结果】\n" + digest)
+    return "\n\n".join(parts)
+
+
+def run_agent_loop(prompt_value) -> AIMessage:
+    """Agent 执行循环：规划 → 工具调用 → 质检修订 → 最终回答。
+
+    三种模式按需触发，简单闲聊不会增加任何额外开销：
+      · Plan：请求包含多步意图时，先分解步骤再执行
+      · Act ：模型自主调用工具，结果回喂后继续推理
+      · Reflect：用过工具或做过规划时，质检草稿并必要时修订
     """
     messages = prompt_value.to_messages()
+    question = _last_human_text(messages)
     calls_made = []
     usage = {"in": 0, "out": 0}
     rounds = 0
+    plan_used = False
+    reflected = False
 
+    # ---------- ① Plan：复杂请求先分解 ----------
+    if PLANNING_ENABLED and QUESTION_PLANNER.need_plan(question):
+        plan = QUESTION_PLANNER.make_plan(model, question)
+        if plan:
+            plan_used = True
+            print("🧭 执行计划：")
+            for ln in plan.splitlines():
+                if ln.strip():
+                    print("   " + ln.strip()[:70])
+            # 插到 system 之后，作为执行指引
+            idx = 1 if messages and not isinstance(messages[0], SystemMessage) else 0
+            messages.insert(idx, SystemMessage(content="【执行计划】\n" + plan))
+
+    # ---------- ② Act：工具调用循环 ----------
     ai = model_with_tools.invoke(messages)
     rounds += 1
     _acc_usage(ai, usage)
@@ -220,17 +319,39 @@ def run_agent_loop(prompt_value) -> AIMessage:
             except Exception as e:
                 result = f"工具执行失败：{e}"
             print(f"   ↳ {str(result)[:60]}")
-            calls_made.append({"name": name, "args": args, "result": str(result)[:200]})
+            calls_made.append({"name": name, "args": args, "result": str(result)[:1000]})
             messages.append(ToolMessage(content=str(result), tool_call_id=call.get("id") or ""))
         ai = model_with_tools.invoke(messages)
         rounds += 1
         _acc_usage(ai, usage)
+
+    draft = ai.content or ""
+
+    # ---------- ③ Reflect：质检 + 修订 ----------
+    if REFLECTION_ENABLED and QUESTION_PLANNER.need_reflect(
+            draft, len(calls_made), plan_used, REFLECT_SAMPLE_RATE, random.random()):
+        ev = _evidence(messages, calls_made)
+        ok, feedback = QUESTION_PLANNER.verify(model, question, draft, ev)
+        if not ok:
+            print(f"🔍 质检未通过：{feedback}")
+            revised = QUESTION_PLANNER.revise(model, question, draft, feedback, ev)
+            if revised and revised != draft:
+                reflected = True
+                draft = revised
+                print("✍️ 已修订回答")
+        else:
+            print("✅ 质检通过")
+
+    if reflected:
+        ai = AIMessage(content=draft)
 
     TURN_STATS.append({
         "session": getattr(_current_session, "who", None),
         "tools": [c["name"] for c in calls_made],
         "calls": calls_made,
         "rounds": rounds,
+        "planned": plan_used,
+        "reflected": reflected,
         "input_tokens": usage["in"],
         "output_tokens": usage["out"],
         "ts": time.time(),

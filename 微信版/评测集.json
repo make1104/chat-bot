@@ -25,6 +25,10 @@
 
     {"id": 18, "类别": "多工具组合", "输入": "现在几点？顺便帮我算一下 25 乘以 4", "expected_tools": ["get_current_time", "calculate"], "expect_keywords": ["100"]},
     {"id": 19, "类别": "多工具组合", "输入": "北京今天天气怎么样，适合出门吗", "expected_tools": ["get_weather"], "expect_keywords": []},
-    {"id": 20, "类别": "多工具组合", "输入": "专业版和团队版差多少钱？", "expected_tools": ["search_knowledge"], "expect_keywords": ["300"]}
+    {"id": 20, "类别": "多工具组合", "输入": "专业版和团队版差多少钱？", "expected_tools": ["search_knowledge"], "expect_keywords": ["300"]},
+
+    {"id": 21, "类别": "多步任务", "输入": "先查一下专业版多少钱，再帮我算买三年一共多少", "expected_tools": ["search_knowledge", "calculate"], "expect_keywords": ["297"]},
+    {"id": 22, "类别": "多步任务", "输入": "帮我查一下团队版的价格，然后算一下比专业版贵多少", "expected_tools": ["search_knowledge", "calculate"], "expect_keywords": ["300"]},
+    {"id": 23, "类别": "多步任务", "输入": "现在几点？顺便算一下 15 的平方是多少", "expected_tools": ["get_current_time", "calculate"], "expect_keywords": ["225"]}
   ]
 }

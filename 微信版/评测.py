@@ -36,13 +36,16 @@ EVAL_SESSION = "__eval__"
 def parse_args():
     args = sys.argv[1:]
     mode = "inject"
+    plan = "on"
     limit = None
     for a in args:
         if a.startswith("--mode="):
             mode = a.split("=", 1)[1].strip()
+        elif a.startswith("--plan="):
+            plan = a.split("=", 1)[1].strip()
         elif a.isdigit():
             limit = int(a)
-    return mode, limit
+    return mode, plan, limit
 
 
 def load_eval_set(limit=None):
@@ -84,6 +87,7 @@ def run_case(case):
         "期望工具": sorted(expect_tools), "实际工具": sorted(got_tools),
         "工具正确": tool_ok, "任务达成": outcome,
         "未调工具但答对": (not got_tools) and outcome and bool(expect_tools),
+        "规划": bool(stats.get("planned")), "反思修订": bool(stats.get("reflected")),
         "回答": (answer or "").replace("\n", " ")[:50],
         "延迟秒": round(elapsed, 2),
         "输入token": stats.get("input_tokens", 0),
@@ -96,16 +100,23 @@ def pct(a, b):
 
 
 def main():
-    mode, limit = parse_args()
-    w.RAG_ALWAYS_INJECT = (mode != "tool")     # 运行时切换 RAG 策略
-    report_file = "评测报告.md" if mode != "tool" else "评测报告_tool模式.md"
+    mode, plan, limit = parse_args()
+    w.RAG_ALWAYS_INJECT = (mode != "tool")          # 运行时切换 RAG 策略
+    w.PLANNING_ENABLED = (plan != "off")            # 运行时切换规划
+    w.REFLECTION_ENABLED = (plan != "off")          # 运行时切换反思
+    tag = ""
+    if mode == "tool":
+        tag += "_tool模式"
+    if plan == "off":
+        tag += "_无规划"
+    report_file = "评测报告%s.md" % tag
 
     cases = load_eval_set(limit)
     use_eval_knowledge()
 
     print("=" * 82)
-    print("Agent 评测开始｜RAG 模式：%s｜用例：%d 条" %
-          ("预注入(inject)" if mode != "tool" else "工具检索(tool)", len(cases)))
+    print("Agent 评测开始｜RAG：%s｜规划+反思：%s｜用例：%d 条"
+          % ("预注入" if mode != "tool" else "工具检索", "开" if plan != "off" else "关", len(cases)))
     print("=" * 82)
 
     results = [run_case(c) for c in cases]
@@ -131,13 +142,19 @@ def main():
     tok_in = sum(r["输入token"] for r in results)
     tok_out = sum(r["输出token"] for r in results)
     tool_calls = sum(len(r["实际工具"]) for r in results)
+    planned_n = sum(1 for r in results if r["规划"])
+    reflected_n = sum(1 for r in results if r["反思修订"])
+    multi = [r for r in results if r["类别"] == "多步任务"]
+    multi_ok = sum(1 for r in multi if r["任务达成"])
 
     summary = [
         ("任务达成率（用户侧结果）", "%.1f%% (%d/%d)" % (pct(achieved, total), achieved, total)),
         ("工具调用完全正确率（行为）", "%.1f%% (%d/%d)" % (pct(tool_correct, total), tool_correct, total)),
         ("需要工具的召回率", "%.1f%% (%d/%d)" % (pct(tool_hit, len(tool_cases)), tool_hit, len(tool_cases))),
         ("无需工具的不误调率", "%.1f%% (%d/%d)" % (pct(no_tool_ok, len(no_tool_cases)), no_tool_ok, len(no_tool_cases))),
+        ("多步任务达成率", "%.1f%% (%d/%d)" % (pct(multi_ok, len(multi)), multi_ok, len(multi)) if multi else "-"),
         ("模型自主判断免工具并答对", "%d 条" % saved),
+        ("规划触发 / 反思修订", "%d 次 / %d 次" % (planned_n, reflected_n)),
         ("平均延迟 / P50 / P95", "%.2fs / %.2fs / %.2fs" % (sum(lat) / total, p50, p95)),
         ("平均每轮工具调用", "%.2f 次" % (tool_calls / total)),
         ("平均每轮 token", "%.0f（输入 %d / 输出 %d）" % ((tok_in + tok_out) / total, tok_in, tok_out)),
