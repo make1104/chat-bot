@@ -86,8 +86,8 @@ except Exception as _e:
             return ""
 
         @staticmethod
-        def need_reflect(*args, **kwargs):
-            return False
+        def detect_risk(*args, **kwargs):
+            return False, []
 
         @staticmethod
         def verify(*args, **kwargs):
@@ -208,7 +208,9 @@ TOOLS_ENABLED = True        # 是否启用工具调用（关掉则退化为纯�
 MAX_TOOL_ROUNDS = 4         # 单轮对话最多几次"模型 → 工具 → 模型"
 PLANNING_ENABLED = True     # 复杂请求是否先分解步骤（Plan-and-Execute）
 REFLECTION_ENABLED = True   # 是否对草稿做质检与修订（Reflexion）
-REFLECT_SAMPLE_RATE = 0.15  # 未用工具的普通回答，按此比例抽查质检（0~1）
+REFLECT_MODE = "risk"       # "risk"=仅高风险时质检（省成本、避免误伤正确答案）
+                            # "always"=只要用过工具或做过规划就质检（旧策略，作为对照）
+REFLECT_SAMPLE_RATE = 0.05  # 非高风险场景的抽样质检比例（用于质量监控）
 
 # 把工具绑定到模型：模型会自主决定是否调用、调用哪个、传什么参数
 model_with_tools = model.bind_tools(TOOLS) if (TOOLS_ENABLED and TOOLS_IMPORT_OK) else model
@@ -281,6 +283,7 @@ def run_agent_loop(prompt_value) -> AIMessage:
     messages = prompt_value.to_messages()
     question = _last_human_text(messages)
     calls_made = []
+    tool_errors = []
     usage = {"in": 0, "out": 0}
     rounds = 0
     plan_used = False
@@ -318,29 +321,47 @@ def run_agent_loop(prompt_value) -> AIMessage:
                 result = fn.invoke(args) if fn else f"未注册的工具：{name}"
             except Exception as e:
                 result = f"工具执行失败：{e}"
-            print(f"   ↳ {str(result)[:60]}")
-            calls_made.append({"name": name, "args": args, "result": str(result)[:1000]})
-            messages.append(ToolMessage(content=str(result), tool_call_id=call.get("id") or ""))
+            res_text = str(result)
+            head = res_text[:30]
+            if (not res_text.strip() or "失败" in head or "未注册" in head
+                    or "未找到" in head or "为空" in head):
+                tool_errors.append(f"{name}: {res_text[:40]}")
+            print(f"   ↳ {res_text[:60]}")
+            calls_made.append({"name": name, "args": args, "result": res_text[:1000]})
+            messages.append(ToolMessage(content=res_text, tool_call_id=call.get("id") or ""))
         ai = model_with_tools.invoke(messages)
         rounds += 1
         _acc_usage(ai, usage)
 
     draft = ai.content or ""
 
-    # ---------- ③ Reflect：质检 + 修订 ----------
-    if REFLECTION_ENABLED and QUESTION_PLANNER.need_reflect(
-            draft, len(calls_made), plan_used, REFLECT_SAMPLE_RATE, random.random()):
+    # ---------- ③ Reflect：风险触发 → 质检 → 修订 ----------
+    if REFLECTION_ENABLED:
         ev = _evidence(messages, calls_made)
-        ok, feedback = QUESTION_PLANNER.verify(model, question, draft, ev)
-        if not ok:
-            print(f"🔍 质检未通过：{feedback}")
-            revised = QUESTION_PLANNER.revise(model, question, draft, feedback, ev)
-            if revised and revised != draft:
-                reflected = True
-                draft = revised
-                print("✍️ 已修订回答")
-        else:
-            print("✅ 质检通过")
+        risky, reasons = QUESTION_PLANNER.detect_risk(
+            draft, ev, len(calls_made), tool_errors, question)
+        should = risky
+        if not should and REFLECT_MODE == "always" and (calls_made or plan_used):
+            should = True
+        if not should and random.random() < REFLECT_SAMPLE_RATE:
+            should, reasons = True, ["抽样质检"]
+
+        if should:
+            if reasons:
+                print("⚠️ 质检触发：" + "；".join(reasons))
+            ok, feedback = QUESTION_PLANNER.verify(model, question, draft, ev)
+            if not ok:
+                print(f"🔍 质检未通过：{feedback}")
+                revised = QUESTION_PLANNER.revise(model, question, draft, feedback, ev)
+                if revised and revised != draft:
+                    reflected = True
+                    draft = revised
+                    print("✍️ 已修订回答")
+            else:
+                print("✅ 质检通过")
+        reflect_triggered = should
+    else:
+        reflect_triggered = False
 
     if reflected:
         ai = AIMessage(content=draft)
@@ -352,6 +373,8 @@ def run_agent_loop(prompt_value) -> AIMessage:
         "rounds": rounds,
         "planned": plan_used,
         "reflected": reflected,
+        "reflect_triggered": reflect_triggered,
+        "tool_errors": tool_errors,
         "input_tokens": usage["in"],
         "output_tokens": usage["out"],
         "ts": time.time(),

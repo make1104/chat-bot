@@ -111,17 +111,64 @@ def revise(model, question: str, draft: str, feedback: str, evidence: str) -> st
         return draft
 
 
-# ==================== 四、反思触发条件 ====================
+# ==================== 四、风险检测（决定要不要质检）====================
+# 反思不是越多越好：一次质检要额外调用模型（+1~2 次、+1 秒级延迟），
+# 且判定错误时会改坏正确答案。因此改为"只在高风险时质检"。
+
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+# 事实型提问的特征词：这类问题若没调工具，编造风险高
+_FACTUAL_HINTS = ("多少", "几", "价格", "多少钱", "天气", "几点", "什么时候", "日期",
+                  "邮箱", "电话", "地址", "谁", "怎么退", "政策", "限制")
 
 
-def need_reflect(draft: str, tool_calls: int, plan_used: bool,
-                 sample_rate: float, rnd: float) -> bool:
-    """是否需要质检：用了工具/做过规划必查，其余按比例抽查。"""
+def _numbers(text: str) -> set:
+    """抽取文本中的阿拉伯数字。"""
+    return set(_NUM_RE.findall(text or ""))
+
+
+def check_numbers(draft: str, evidence: str, question: str = "") -> list:
+    """本地数字一致性检查（零成本）。
+
+    草稿里出现的数字若在前面依据（系统资料 + 工具结果）和用户问题里都找不到出处，
+    说明可能是模型心算或编造出来的 —— 这是最高风险的失败模式。
+    """
+    if not draft:
+        return []
+    ev = evidence or ""
+    q = question or ""
+    return sorted(n for n in _numbers(draft) if n not in ev and n not in q)
+
+
+def _looks_factual(question: str) -> bool:
+    q = question or ""
+    return any(h in q for h in _FACTUAL_HINTS)
+
+
+def detect_risk(draft: str, evidence: str, tool_calls: int, tool_errors: list,
+                question: str) -> tuple:
+    """风险检测：返回 (是否高风险, 原因列表)。
+
+    三类风险信号：
+      ① 数字无出处 —— 回答里的数字在依据中找不到（最可能算错/编造）
+      ② 工具异常   —— 有工具执行失败或返回空，模型却照常作答
+      ③ 事实型提问但没调工具 —— 该查不查
+    """
+    reasons = []
     if not draft or len(draft.strip()) < 8:
-        return False
-    if tool_calls > 0 or plan_used:
-        return True
-    return rnd < sample_rate
+        return False, []
+
+    bad = check_numbers(draft, evidence, question)
+    if bad:
+        reasons.append("数字 %s 无出处" % ",".join(bad[:3]))
+
+    if tool_errors:
+        reasons.append("工具异常：%s" % str(tool_errors[0])[:40])
+
+    if tool_calls == 0 and _looks_factual(question):
+        reasons.append("事实型提问但未调用工具")
+
+    return bool(reasons), reasons
 
 
 if __name__ == "__main__":
@@ -136,3 +183,18 @@ if __name__ == "__main__":
     print("复杂度判定（是否需要规划）：")
     for s in samples:
         print("  %-34s -> %s" % (s, "需要规划" if need_plan(s) else "直接回答"))
+
+    print()
+    print("风险检测（是否需要质检）：")
+    ev = "专业版 99 元每年；团队版 399 元每年"
+    risk_cases = [
+        ("专业版 99 元一年", ev, 1, [], "专业版多少钱", "数字有出处 → 正常"),
+        ("三年一共 297 元", ev, 1, [], "专业版多少钱", "297 无出处 → 风险"),
+        ("客服邮箱是 support@x.com", "", 0, [], "客服邮箱是什么", "事实型未调工具 → 风险"),
+        ("今天天气不错呀", ev, 0, [], "在吗", "闲聊 → 正常"),
+        ("查询失败，我也不知道", ev, 1, ["get_weather: 查询失败"], "北京天气", "工具异常 → 风险"),
+    ]
+    for draft, e, tc, errs, q, note in risk_cases:
+        risky, reasons = detect_risk(draft, e, tc, errs, q)
+        print("  [%s] %-22s %s %s"
+              % ("风险" if risky else "正常", draft[:20], note, reasons if reasons else ""))
