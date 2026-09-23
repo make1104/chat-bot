@@ -26,14 +26,15 @@ import random
 import re
 import sqlite3
 import sys
+import threading
 import time
 from operator import itemgetter
 
 from dotenv import load_dotenv
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.messages import AIMessage, HumanMessage, trim_messages
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, trim_messages
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -55,6 +56,15 @@ except Exception as _e:
     VOICE_IMPORT_OK = False
     print(f"⚠️ 语音模块不可用（{_e}），语音功能会自动跳过")
 
+# 工具集（同目录的 工具.py）：让机器人能"办事"而不只是聊天
+try:
+    from 工具 import TOOLS, TOOL_MAP, set_history_search, set_knowledge_search
+
+    TOOLS_IMPORT_OK = True
+except Exception as _e:
+    TOOLS, TOOL_MAP, TOOLS_IMPORT_OK = [], {}, False
+    print(f"⚠️ 工具模块不可用（{_e}），将退化为纯对话模式")
+
 load_dotenv()
 
 if not os.environ.get("DEEPSEEK_API_KEY"):
@@ -65,6 +75,8 @@ if not os.environ.get("DEEPSEEK_API_KEY"):
 # 但需要额外安装 sentence-transformers / faiss-cpu（Windows 上体积较大）
 KB_FILE = "知识库.txt"   # 知识库文件（放本项目目录，UTF-8 编码的 txt）
 TOP_K = 3                # 每次检索返回的片段数
+RAG_ALWAYS_INJECT = True  # True=每次对话都预注入知识片段（稳，费 token）
+                          # False=不预注入，由模型自主决定是否调用 search_knowledge 工具（Agentic RAG）
 
 if os.path.exists(KB_FILE):
     with open(KB_FILE, encoding="utf-8") as f:
@@ -83,6 +95,39 @@ def retrieve(query: str) -> str:
         return "（知识库为空）"
     docs = sorted(_chunks, key=lambda c: -len(set(query) & set(c)))[:TOP_K]
     return "\n\n".join(f"[片段{i+1}] {d}" for i, d in enumerate(docs))
+
+
+def search_history(keyword: str) -> str:
+    """在**当前会话**的历史记录里搜索关键词（供 Agent 的 search_history 工具调用）。
+
+    只查当前会话，避免把别的聊天内容串进来。
+    """
+    kw = (keyword or "").strip()
+    who = getattr(_current_session, "who", None)
+    if not kw:
+        return "（请提供要搜索的关键词）"
+    try:
+        conn = _db()
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE who=? AND content LIKE ? "
+            "ORDER BY id DESC LIMIT 6",
+            (who, f"%{kw}%"),
+        ).fetchall() if who else []
+        conn.close()
+    except Exception as e:
+        return f"历史检索失败：{e}"
+    if not rows:
+        return f"当前会话的历史记录里没有找到「{kw}」"
+    lines = []
+    for role, content in rows:
+        speaker = "对方" if role == "human" else "我"
+        lines.append(f"{speaker}：{content[:60]}")
+    return "\n".join(reversed(lines))
+
+
+# 把检索能力注入工具模块（工具写在 工具.py，用注入避免循环依赖）
+set_knowledge_search(retrieve)
+set_history_search(search_history)
 
 
 # ==================== LangChain：带记忆的对话核心（同 v2 + RAG） ====================
@@ -124,15 +169,86 @@ trimmer = trim_messages(
     start_on="human",
 )
 
+# ==================== Agent：工具调用循环 ====================
+TOOLS_ENABLED = True       # 是否启用工具调用（关掉则退化为纯对话机器人）
+MAX_TOOL_ROUNDS = 4        # 单轮对话最多几次"模型 → 工具 → 模型"
+
+# 把工具绑定到模型：模型会自主决定是否调用、调用哪个、传什么参数
+model_with_tools = model.bind_tools(TOOLS) if (TOOLS_ENABLED and TOOLS_IMPORT_OK) else model
+
+# 当前会话（线程局部）：让"检索历史"这类工具知道该查哪个会话，避免串台
+_current_session = threading.local()
+
+# 可观测性：记录每轮对话的工具调用与 token 用量（供评测 / 监控读取）
+TURN_STATS = collections.deque(maxlen=500)
+
+
+def _acc_usage(ai, acc: dict) -> None:
+    """累计一条模型返回的 token 用量。"""
+    u = getattr(ai, "usage_metadata", None) or {}
+    acc["in"] = acc.get("in", 0) + int(u.get("input_tokens") or 0)
+    acc["out"] = acc.get("out", 0) + int(u.get("output_tokens") or 0)
+
+
+def run_agent_loop(prompt_value) -> AIMessage:
+    """Agent 执行循环：模型判断 → 调用工具 → 结果回喂 → 直到给出最终回答。
+
+    这就是「Agent」与「聊天机器人」的分界：模型不再只是生成文本，
+    而是能主动获取信息、执行计算，再基于结果作答。
+    """
+    messages = prompt_value.to_messages()
+    calls_made = []
+    usage = {"in": 0, "out": 0}
+    rounds = 0
+
+    ai = model_with_tools.invoke(messages)
+    rounds += 1
+    _acc_usage(ai, usage)
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        calls = getattr(ai, "tool_calls", None) or []
+        if not calls:
+            break
+        messages.append(ai)
+        for call in calls:
+            name = call.get("name") or ""
+            args = call.get("args") or {}
+            print(f"🔧 工具调用：{name}({args})")
+            fn = TOOL_MAP.get(name)
+            try:
+                result = fn.invoke(args) if fn else f"未注册的工具：{name}"
+            except Exception as e:
+                result = f"工具执行失败：{e}"
+            print(f"   ↳ {str(result)[:60]}")
+            calls_made.append({"name": name, "args": args, "result": str(result)[:200]})
+            messages.append(ToolMessage(content=str(result), tool_call_id=call.get("id") or ""))
+        ai = model_with_tools.invoke(messages)
+        rounds += 1
+        _acc_usage(ai, usage)
+
+    TURN_STATS.append({
+        "session": getattr(_current_session, "who", None),
+        "tools": [c["name"] for c in calls_made],
+        "calls": calls_made,
+        "rounds": rounds,
+        "input_tokens": usage["in"],
+        "output_tokens": usage["out"],
+        "ts": time.time(),
+    })
+    return ai
+
+
 chain = (
     RunnablePassthrough.assign(
         history=itemgetter("history") | trimmer,
-        context=lambda x: retrieve(x["input"]),       # RAG：根据问题检索知识库
+        # RAG 两种策略：预注入（默认，稳）或交给模型用工具检索（省 token，更 Agent）
+        context=lambda x: (retrieve(x["input"]) if RAG_ALWAYS_INJECT
+                           else "（未预注入参考知识；如需查询资料，请调用 search_knowledge 工具）"),
         profile=lambda x: format_profile(x["who"]),   # 长期记忆：用户画像
         state=lambda x: format_state(x["who"]),       # 情绪状态：心情/好感度/精力
     )
     | prompt
-    | model
+    | RunnableLambda(run_agent_loop)                  # Agent：带工具调用的执行循环
 )
 
 # ==================== 长期记忆 + 用户画像（SQLite） ====================
@@ -419,6 +535,7 @@ def sanitize(text: str) -> str:
 
 def ask_bot(session_id: str, text: str, profile_key: str = None) -> str:
     """对一个会话调用一次 DeepSeek，返回回复文本。profile_key 用于取用户画像。"""
+    _current_session.who = session_id   # 供 search_history 等工具定位当前会话
     try:
         response = chatbot.invoke(
             {"input": sanitize(text), "who": profile_key or session_id},

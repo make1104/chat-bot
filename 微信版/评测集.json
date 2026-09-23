@@ -1,0 +1,30 @@
+{
+  "说明": "Agent 能力评测集。expected_tools 为期望调用的工具名；expect_keywords 为回答中应出现的关键词（用于判断是否正确）。",
+  "cases": [
+    {"id": 1, "类别": "工具-时间", "输入": "现在几点了？", "expected_tools": ["get_current_time"], "expect_keywords": []},
+    {"id": 2, "类别": "工具-时间", "输入": "今天星期几？", "expected_tools": ["get_current_time"], "expect_keywords": []},
+
+    {"id": 3, "类别": "工具-计算", "输入": "帮我算一下 128 乘以 37 再加 456", "expected_tools": ["calculate"], "expect_keywords": ["5192"]},
+    {"id": 4, "类别": "工具-计算", "输入": "(85+15)*3 等于多少", "expected_tools": ["calculate"], "expect_keywords": ["300"]},
+    {"id": 5, "类别": "工具-计算", "输入": "100 除以 8 是多少", "expected_tools": ["calculate"], "expect_keywords": ["12.5"]},
+    {"id": 6, "类别": "工具-计算", "输入": "2 的 10 次方等于几", "expected_tools": ["calculate"], "expect_keywords": ["1024"]},
+
+    {"id": 7, "类别": "工具-天气", "输入": "北京今天天气怎么样", "expected_tools": ["get_weather"], "expect_keywords": []},
+    {"id": 8, "类别": "工具-天气", "输入": "上海现在冷不冷", "expected_tools": ["get_weather"], "expect_keywords": []},
+
+    {"id": 9, "类别": "工具-知识库", "输入": "专业版多少钱？", "expected_tools": ["search_knowledge"], "expect_keywords": ["99"]},
+    {"id": 10, "类别": "工具-知识库", "输入": "团队版的价格是多少", "expected_tools": ["search_knowledge"], "expect_keywords": ["399"]},
+    {"id": 11, "类别": "工具-知识库", "输入": "我想退款，怎么操作？", "expected_tools": ["search_knowledge"], "expect_keywords": ["7"]},
+    {"id": 12, "类别": "工具-知识库", "输入": "客服邮箱是什么", "expected_tools": ["search_knowledge"], "expect_keywords": ["support"]},
+    {"id": 13, "类别": "工具-知识库", "输入": "免费版有什么限制", "expected_tools": ["search_knowledge"], "expect_keywords": ["100"]},
+
+    {"id": 14, "类别": "无需工具", "输入": "你好呀", "expected_tools": [], "expect_keywords": []},
+    {"id": 15, "类别": "无需工具", "输入": "今天心情还不错", "expected_tools": [], "expect_keywords": []},
+    {"id": 16, "类别": "无需工具", "输入": "陪我说说话吧", "expected_tools": [], "expect_keywords": []},
+    {"id": 17, "类别": "无需工具", "输入": "你喜欢喝茶吗", "expected_tools": [], "expect_keywords": []},
+
+    {"id": 18, "类别": "多工具组合", "输入": "现在几点？顺便帮我算一下 25 乘以 4", "expected_tools": ["get_current_time", "calculate"], "expect_keywords": ["100"]},
+    {"id": 19, "类别": "多工具组合", "输入": "北京今天天气怎么样，适合出门吗", "expected_tools": ["get_weather"], "expect_keywords": []},
+    {"id": 20, "类别": "多工具组合", "输入": "专业版和团队版差多少钱？", "expected_tools": ["search_knowledge"], "expect_keywords": ["300"]}
+  ]
+}
